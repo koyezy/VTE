@@ -1,0 +1,701 @@
+---
+title: "Simulation Plan"
+author: "Yeji Ko"
+date: "11/27/2024"
+output:
+  rmdformats::robobook:
+    thumbnails: no
+    lightbox: yes
+    gallery: no
+    highlight: tango
+    use_bookdown: no
+    toc_depth: 2
+    fig_caption: yes
+    code_folding: hide
+    embed_fonts: no
+    keep_md: no
+    number_sections: yes
+    html_document:
+    df_print: paged
+---
+
+
+```{r, message=FALSE}
+library(table1)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(norm)
+library(mice)
+library(magrittr)
+library(purrr)
+library(caret)
+library(condMVNorm)
+library(compositions)
+library(tensorflow)
+library(keras3)
+library(Hmisc)
+library(rms)
+library(knitr)
+library(randomForestSRC)
+library(pec)
+library(viridis)
+library(gridExtra)
+library(MASS)
+library(DescTools)
+library(reticulate)
+library(fastDummies)
+
+setwd("/Users/yejiko/Downloads/PhD/Grant")
+source("/Users/yejiko/Downloads/PhD/Grant/prelim/function.R")
+data.clean <- readRDS(file="/Users/yejiko/Downloads/PhD/Grant/prelim/data.rda")
+clarity = readRDS("/Users/yejiko/Downloads/PhD/Grant/clarity.analysis.dataset.rds")
+
+# derivation cohort
+data.mod <- data.clean[data.clean$validation == 0,]
+data.mod <- clarity[clarity$validation.starting.cy2021==0,]
+
+# implementation cohort
+data.val <- data.clean[data.clean$validation == 1,]
+```
+
+```{r}
+# 10 predictors and 1 outcome
+varlist = c("vte.hac", "THROMBOSIS_HX", "BMI_FIRST_VALUE",
+            "CENTRAL_LINE_DURING_ENC", "HYPOXEMIA", "admit.type", 
+             "WBC_FIRST_VAL", "BUN_FIRST_VAL", "HEART_RATE_FIRST_VALUE",
+             "FIRST_BRADEN_SCALE_SCORE", "CRP_FIRST_VAL")
+
+data_sim = data.mod[complete.cases(data.mod[,setdiff(varlist, "CRP_FIRST_VAL")]), varlist] # 219371 obs
+data_sim = data_sim[data_sim$BMI<=50 & data_sim$BMI>=10,] # only allow patients with BMI between 10 to 50
+data_comp = data.mod[complete.cases(data.mod[,varlist]), varlist] # 38260 obs
+data_comp = data_comp[data_comp$BMI<=50 & data_comp$BMI>=10,] # delete patient with BMI > 50
+```
+
+# Data exploration
+
+```{r}
+data_sim$admit.type = as.character(data_sim$admit.type)
+data_sim$otc <- ifelse(is.na(data_sim$CRP_FIRST_VAL),1,0)
+data_sim$otc <- factor(data_sim$otc, levels=c(0,1), 
+                       labels=c("CRP-present", "CRP-absent"))
+data_sim2 = data_sim[,-11]
+label(data_sim2$vte.hac) = "Hospital-acquired VTE"
+label(data_sim2$THROMBOSIS_HX) = "History of Thrombosis"
+label(data_sim2$BMI_FIRST_VALUE) = "Body Mass Index"
+label(data_sim2$CENTRAL_LINE_DURING_ENC) = "Central Line"
+label(data_sim2$HYPOXEMIA) = "Hypoxemia"
+label(data_sim2$admit.type) = "Admission Type"
+label(data_sim2$WBC_FIRST_VAL) = "White Blood Cell Count"
+label(data_sim2$BUN_FIRST_VAL) = "Blood Urea Nitrogen"
+label(data_sim2$HEART_RATE_FIRST_VALUE) = "Heart Rate"
+label(data_sim2$FIRST_BRADEN_SCALE_SCORE) = "Braden Score"
+
+table1(~ vte.hac + THROMBOSIS_HX + HYPOXEMIA + CENTRAL_LINE_DURING_ENC + 
+            admit.type +
+            HEART_RATE_FIRST_VALUE + BMI_FIRST_VALUE + 
+            FIRST_BRADEN_SCALE_SCORE + WBC_FIRST_VAL + BUN_FIRST_VAL| otc, 
+         data=data_sim2,  overall = F,
+         render = rndr, 
+         render.continuous = c(. = "Median (IQR)"),
+         caption="Table 1. Comparing CRP-present vs. CRP-absent patients", topclass="Rtable1-zebra")
+
+
+tapply(data_sim2$HEART_RATE_FIRST_VALUE, data_sim2$otc,
+       quantile, probs = c(0.25, 0.75), na.rm = TRUE)
+tapply(data_sim2$BMI_FIRST_VALUE, data_sim2$otc,
+       quantile, probs = c(0.25, 0.75), na.rm = TRUE)
+tapply(data_sim2$FIRST_BRADEN_SCALE_SCORE, data_sim2$otc,
+       quantile, probs = c(0.25, 0.75), na.rm = TRUE)
+tapply(data_sim2$WBC_FIRST_VAL, data_sim2$otc,
+       quantile, probs = c(0.25, 0.75), na.rm = TRUE)
+tapply(data_sim2$BUN_FIRST_VAL, data_sim2$otc,
+       quantile, probs = c(0.25, 0.75), na.rm = TRUE)
+quantile(data_sim$CRP_FIRST_VAL, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+
+```
+
+```{r}
+data_sim %<>%
+  mutate(across(all_of(c("CENTRAL_LINE_DURING_ENC", "vte.hac", "THROMBOSIS_HX", "HYPOXEMIA")), as.character)) %>%
+  mutate(across(all_of(c("CENTRAL_LINE_DURING_ENC", "vte.hac", "THROMBOSIS_HX", "HYPOXEMIA")), as.numeric))
+
+data_comp %<>%
+  mutate(across(all_of(c("CENTRAL_LINE_DURING_ENC", "vte.hac", "THROMBOSIS_HX", "HYPOXEMIA")), as.character)) %>%
+  mutate(across(all_of(c("CENTRAL_LINE_DURING_ENC", "vte.hac", "THROMBOSIS_HX", "HYPOXEMIA")), as.numeric))
+
+data_sim$admit.type = factor(data_sim$admit.type)
+data_comp$admit.type = factor(data_comp$admit.type)
+```
+
+# Simulation
+
+```{r}
+set.seed(1234)
+ns=100
+
+#~300 samples each (10000*0.3*0.1 for crp-absent patients)
+sim_w11w = simulate.all(data_comp, dep.outcome="weak", outcome.rate=0.1, outcome.interaction=T, dep.absence="weak",
+                         absence.rate=0.1, nsim=ns)
+sim_w11m = simulate.all(data_comp, dep.outcome="weak", outcome.rate=0.1, outcome.interaction=T, dep.absence="moderate",
+                         absence.rate=0.1, nsim=ns)
+sim_w11s = simulate.all(data_comp, dep.outcome="weak", outcome.rate=0.1, outcome.interaction=T, dep.absence="strong",
+                         absence.rate=0.1, nsim=ns)
+sim_w14w = simulate.all(data_comp, dep.outcome="weak", outcome.rate=0.1, outcome.interaction=T, dep.absence="weak",
+                         absence.rate=0.4, nsim=ns)
+sim_w14m = simulate.all(data_comp, dep.outcome="weak", outcome.rate=0.1, outcome.interaction=T, dep.absence="moderate",
+                         absence.rate=0.4, nsim=ns)
+sim_w14s = simulate.all(data_comp, dep.outcome="weak", outcome.rate=0.1, outcome.interaction=T, dep.absence="strong",
+                         absence.rate=0.4, nsim=ns)
+sim_w17w = simulate.all(data_comp, dep.outcome="weak", outcome.rate=0.1, outcome.interaction=T, dep.absence="weak",
+                         absence.rate=0.7, nsim=ns)
+sim_w17m = simulate.all(data_comp, dep.outcome="weak", outcome.rate=0.1, outcome.interaction=T, dep.absence="moderate",
+                         absence.rate=0.7, nsim=ns)
+sim_w17s = simulate.all(data_comp, dep.outcome="weak", outcome.rate=0.1, outcome.interaction=T, dep.absence="strong",
+                         absence.rate=0.7, nsim=ns)
+sim_m11w = simulate.all(data_comp, dep.outcome="moderate", outcome.rate=0.1, outcome.interaction=T, dep.absence="weak",
+                         absence.rate=0.1, nsim=ns)
+sim_m11m = simulate.all(data_comp, dep.outcome="moderate", outcome.rate=0.1, outcome.interaction=T, dep.absence="moderate",
+                         absence.rate=0.1, nsim=ns)
+sim_m11s = simulate.all(data_comp, dep.outcome="moderate", outcome.rate=0.1, outcome.interaction=T, dep.absence="strong",
+                         absence.rate=0.1, nsim=ns)
+sim_m14w = simulate.all(data_comp, dep.outcome="moderate", outcome.rate=0.1, outcome.interaction=T, dep.absence="weak",
+                         absence.rate=0.4, nsim=ns)
+sim_m14m = simulate.all(data_comp, dep.outcome="moderate", outcome.rate=0.1, outcome.interaction=T, dep.absence="moderate",
+                         absence.rate=0.4, nsim=ns)
+sim_m14s = simulate.all(data_comp, dep.outcome="moderate", outcome.rate=0.1, outcome.interaction=T, dep.absence="strong",
+                         absence.rate=0.4, nsim=ns)
+sim_m17w = simulate.all(data_comp, dep.outcome="moderate", outcome.rate=0.1, outcome.interaction=T, dep.absence="weak",
+                         absence.rate=0.7, nsim=ns)
+sim_m17m = simulate.all(data_comp, dep.outcome="moderate", outcome.rate=0.1, outcome.interaction=T, dep.absence="moderate",
+                         absence.rate=0.7, nsim=ns)
+sim_m17s = simulate.all(data_comp, dep.outcome="moderate", outcome.rate=0.1, outcome.interaction=T, dep.absence="strong",
+                         absence.rate=0.7, nsim=ns)
+sim_s11w = simulate.all(data_comp, dep.outcome="strong", outcome.rate=0.1, outcome.interaction=T, dep.absence="weak",
+                         absence.rate=0.1, nsim=ns)
+sim_s11m = simulate.all(data_comp, dep.outcome="strong", outcome.rate=0.1, outcome.interaction=T, dep.absence="moderate",
+                         absence.rate=0.1, nsim=ns)
+sim_s11s = simulate.all(data_comp, dep.outcome="strong", outcome.rate=0.1, outcome.interaction=T, dep.absence="strong",
+                         absence.rate=0.1, nsim=ns)
+sim_s14w = simulate.all(data_comp, dep.outcome="strong", outcome.rate=0.1, outcome.interaction=T, dep.absence="weak",
+                         absence.rate=0.4, nsim=ns)
+sim_s14m = simulate.all(data_comp, dep.outcome="strong", outcome.rate=0.1, outcome.interaction=T, dep.absence="moderate",
+                         absence.rate=0.4, nsim=ns)
+sim_s14s = simulate.all(data_comp, dep.outcome="strong", outcome.rate=0.1, outcome.interaction=T, dep.absence="strong",
+                         absence.rate=0.4, nsim=ns)
+sim_s17w = simulate.all(data_comp, dep.outcome="strong", outcome.rate=0.1, outcome.interaction=T, dep.absence="weak",
+                         absence.rate=0.7, nsim=ns)
+sim_s17m = simulate.all(data_comp, dep.outcome="strong", outcome.rate=0.1, outcome.interaction=T, dep.absence="moderate",
+                         absence.rate=0.7, nsim=ns)
+sim_s17s = simulate.all(data_comp, dep.outcome="strong", outcome.rate=0.1, outcome.interaction=T, dep.absence="strong",
+                         absence.rate=0.7, nsim=ns)
+```
+
+# Summarizing results: Imputation  performance in bias and rmse
+
+```{r}
+tab_imp = data.frame(matrix(NA, nrow=27, ncol=12))
+tab_imp[,1] = rep(c("absence 0.1, weak", "absence 0.1, moderate", "absence 0.1, strong",
+                      "absence 0.4, weak", "absence 0.4, moderate", "absence 0.4, strong",
+                      "absence 0.7, weak", "absence 0.7, moderate", "absence 0.7, strong"), 3)
+tab_imp[,2] = rep(c("weak", "moderate", "strong"),each=9)
+
+all = list(sim_w11w$impute, sim_w11m$impute, sim_w11s$impute, sim_w14w$impute, 
+        sim_w14m$impute, sim_w14s$impute, sim_w17w$impute, sim_w17m$impute, sim_w17s$impute,
+        sim_m11w$impute, sim_m11m$impute, sim_m11s$impute, sim_m14w$impute, 
+        sim_m14m$impute, sim_m14s$impute, sim_m17w$impute, sim_m17m$impute, sim_m17s$impute,
+        sim_s11w$impute, sim_s11m$impute, sim_s11s$impute, sim_s14w$impute, 
+        sim_s14m$impute, sim_s14s$impute, sim_s17w$impute, sim_s17m$impute, sim_s17s$impute)
+
+# delete mice_list, jm_list, da_list: we will use the first set of imputed values
+m_times = 5
+
+clean_and_convert <- function(main_list) {
+  # Targets and the desired final column names
+  target_methods <- c("mice_list", "da_list", "jm_list")
+  out_names <- c("mice", "da", "jm")
+  
+  lapply(main_list, function(level1) {
+    lapply(level1, function(level2) {
+      
+      # 1. Identify rows to keep based on the missingness indicator
+      # Grab from the first method list to create the mask
+      first_method_list <- level2[[target_methods[1]]]
+      is_missing <- which(first_method_list[[1]]$miss == 1)
+      
+      # 2. Extract and average the 3 target methods
+      imputed_data <- list()
+      for (m in seq_along(target_methods)) {
+        method_key <- target_methods[m]
+        
+        # Fast matrix extraction and row averaging
+        mat <- sapply(level2[[method_key]], function(df) df$CRP_FIRST_VAL)
+        
+        # Store directly with the clean names (mice, da, jm)
+        imputed_data[[out_names[m]]] <- rowMeans(mat, na.rm = TRUE)[is_missing]
+      }
+
+      # 3. Handle constants (keeping only 'true' and 'median' as per your previous logic)
+      # You can add other variable names to this vector if needed
+      kept_vars <- level2[names(level2) %in% c("true", "median", "cm")]
+      
+      # 4. Final assembly: returns a dataframe with columns: true, median, mice, da, jm
+      tryCatch({
+        data.frame(kept_vars, imputed_data)
+      }, error = function(e) {
+        # Fallback to keep the structure even if imputation data is missing
+        data.frame(kept_vars)
+      })
+    })
+  })
+}
+
+all_update = clean_and_convert(all)
+
+compute_rmse_bias <- function(all_update, methods, tab_imp, rmse_cols, bias_cols) {
+  
+  for(i in 1:27){
+    
+    temp <- all_update[[i]]
+    
+    rmse_res <- numeric(length(methods))
+    bias_res <- numeric(length(methods))
+    
+    for(m in seq_along(methods)) {
+      method <- methods[m]
+      
+      mse_m <- sapply(temp, function(df){
+        true_vals <- df$true
+        imp_vals  <- df[[method]]
+        
+        mean((imp_vals - true_vals)^2, na.rm = TRUE)
+      })
+      
+      bias_m <- sapply(temp, function(df){
+        true_vals <- df$true
+        imp_vals  <- df[[method]]
+        
+        mean(imp_vals - true_vals, na.rm = TRUE)
+      })
+      
+      true_mean <- sapply(temp, function(df){
+        mean(df$true, na.rm = TRUE)
+      })
+      
+      rmse_res[m] <- sqrt(mean(mse_m, na.rm = TRUE))
+      bias_res[m] <- 100 * mean(bias_m, na.rm = TRUE) / mean(true_mean, na.rm = TRUE) # percent bias
+    }
+    
+    tab_imp[i, rmse_cols] <- rmse_res
+    tab_imp[i, bias_cols] <- bias_res
+  }
+  
+  return(tab_imp)
+}
+
+methods <- c("median", "cm", "mice", "jm", "da")
+
+tab_imp <- compute_rmse_bias(
+  all_update,
+  methods = methods,
+  tab_imp = tab_imp,
+  rmse_cols = 3:7,
+  bias_cols = 8:12
+)
+
+colnames(tab_imp) = c("scenario", "dep.outcome", 
+                      "median_rmse", "cm_rmse", "mice_rmse", "jm_rmse", "da_rmse",
+                      "median_bias", "cm_bias", "mice_bias",  "jm_bias" , "da_bias")
+```
+
+```{r}
+# imputation results
+# tab_imp2 = tab_imp[c(1,2,8:12)] %>% pivot_longer(cols=c("median_bias", "cm_bias", "mice_bias",  "jm_bias" , "da_bias"))
+# tab_imp2$name = factor(tab_imp2$name, levels = c("median_bias", "cm_bias", "mice_bias", "jm_bias", "da_bias"),
+#                        labels = c("median", "cm", "mice", "jm", "da"))
+
+tab_imp2 = tab_imp[c(1,2,3:7)] %>% pivot_longer(cols=c("median_rmse", "cm_rmse", "mice_rmse", "jm_rmse", "da_rmse"))
+tab_imp2$name = factor(tab_imp2$name, levels = c("median_rmse", "cm_rmse", "mice_rmse", "jm_rmse", "da_rmse"),
+                        labels = c("median", "cm", "mice", "jm", "da"))
+
+tab_imp2$dep.outcome = factor(tab_imp2$dep.outcome, levels=c("weak", "moderate", "strong"))
+tab_imp2$absence = tab_imp2$scenario %>%  str_extract("(0.[0-9])") %>% as.numeric()
+tab_imp2$dep.absence = tab_imp2$scenario %>%  str_extract("(?<=\\, ).*")
+tab_imp2$dep.absence = factor(tab_imp2$dep.absence, levels=c("weak", "moderate", "strong"))
+labs_out <- c(
+  weak     = "Weak~dependence~of~italic(Y)~on~italic(X)",
+  moderate = "Moderate~dependence~of~italic(Y)~on~italic(X)",
+  strong   = "Strong~dependence~of~italic(Y)~on~italic(X)"
+)
+labs_abs <- c(
+  weak     = "Weak~dependence~of~italic(M)~on~italic(X*','*Y)",
+  moderate = "Moderate~dependence~of~italic(M)~on~italic(X*','*Y)",
+  strong   = "Strong~dependence~of~italic(M)~on~italic(X*','*Y)"
+)
+
+method_labels <- c(
+  median = "Fixed-value imputation",
+  cm = "Conditional modeling",
+  mice = "MICE",
+  jm = "Joint modeling",
+  da = "Data augmentation")
+```
+
+```{r}
+pdf("/Users/yejiko/Downloads/imputation_pbias.pdf", height=8, width=12)
+
+tab_imp2  %>% 
+  ggplot(aes(x=factor(absence), y=value, group=name, color=name)) + geom_point() + 
+  geom_line(lty=2, linewidth = .8) + 
+  # annotate("rect",
+  #        xmin = -Inf, xmax = Inf,
+  #        ymin = -10, ymax = 10,
+  #        fill = "grey", alpha = 0.4) +
+  xlab(expression("Absence rate " * "P" * "[" * italic(M) == 1 * "]")) +
+  ylab("Percent bias in imputed biomarker (%)") + 
+  facet_grid(dep.absence ~ dep.outcome, 
+             labeller = labeller(dep.absence = as_labeller(labs_abs, label_parsed),
+                                 dep.outcome = as_labeller(labs_out, label_parsed))) + 
+  labs(color="Imputation method")+
+  scale_color_discrete(breaks = levels(tab_imp2$name), labels = method_labels[levels(tab_imp2$name)]) +
+  #geom_hline(yintercept = 0, linetype = "dashed", size = .8) + 
+  theme_bw()
+
+graphics.off()
+```
+
+# Summarizing results: Prediction performance for individual models
+
+```{r}
+ns = 100
+tab_pred = data.frame(matrix(NA, nrow=27, ncol=7))
+colnames(tab_pred) = c("scenario", "dep.outcome", "median", "cm", "mice", "jm", "da")
+tab_pred$scenario = rep(c("absence 0.1, weak", "absence 0.1, moderate", "absence 0.1, strong",
+                          "absence 0.4, weak", "absence 0.4, moderate", "absence 0.4, strong",
+                          "absence 0.7, weak", "absence 0.7, moderate", "absence 0.7, strong"), 3)
+tab_pred$dep.outcome = rep(c("weak", "moderate", "strong"), each = 9)
+
+pred_list = list(sim_w11w, sim_w11m, sim_w11s, sim_w14w, 
+                 sim_w14m, sim_w14s, sim_w17w, sim_w17m, sim_w17s,
+                 sim_m11w, sim_m11m, sim_m11s, sim_m14w, 
+                 sim_m14m, sim_m14s, sim_m17w, sim_m17m, sim_m17s,
+                 sim_s11w, sim_s11m, sim_s11s, sim_s14w, 
+                 sim_s14m, sim_s14s, sim_s17w, sim_s17m, sim_s17s)
+
+all = list()
+
+for(i in 1:length(pred_list)){
+  all[[i]] = lapply(1:ns, function(j) pred_list[[i]]$predict[[j]]$dnn)
+}
+
+# 1. calculate rmse for each dataframe
+methods <- c("median", "cm", "mice", "jm", "da")
+
+rmse_df <- do.call(rbind, lapply(seq_along(all), function(i) {
+  lst <- all[[i]]
+  
+  do.call(rbind, lapply(seq_along(lst), function(j) {
+    df <- lst[[j]]
+    
+    data.frame(
+      list_id = i,
+      df_id = j,
+      true = mean(df$true),
+      median = mean(df$median),
+      cm    = mean(df$cm),
+      mice   = mean(df$mice),
+      jm    = mean(df$jm),
+      da     = mean(df$da)
+    )
+  }))
+}))
+
+# 2. average rmse for each list (or scenario)
+pred_summary <- aggregate(
+  rmse_df[, c("true","median","cm","mice","jm","da")],
+  by = list(list_id = rmse_df$list_id),
+  FUN = mean,
+  na.rm = TRUE
+)
+
+
+tab_pred[,3:7] = 100*(pred_summary[,3:7] - pred_summary[,2])/pred_summary[,2] # percent bias
+
+# prediction results
+tab_pred = pivot_longer(tab_pred, cols = c("median", "cm", "mice", "jm", "da"),
+                        names_to = "name", values_to = "value")
+
+tab_pred$dep.outcome = factor(tab_pred$dep.outcome, levels = c("weak", "moderate", "strong"), 
+                              labels = c("Weak dependence of Y on X", "Moderate dependence of Y on X", "Strong dependence of Y on X"))
+tab_pred$absence = tab_pred$scenario %>% str_extract("(0.[0-9])") %>% as.numeric()
+tab_pred$dep.absence = tab_pred$scenario %>% str_extract("(?<=\\, ).*")
+tab_pred$dep.absence = factor(tab_pred$dep.absence, levels = c("weak", "moderate", "strong"), 
+                              labels = c("Weak dependence of M on X,Y", "Moderate dependence of M on X,Y", 
+                                         "Strong dependence of M on X,Y"))
+tab_pred$name = factor(tab_pred$name, levels = c("median", "cm", "mice", "jm", "da"))
+`%ni%` <- Negate(`%in%`)
+```
+
+```{r}
+pdf("/Users/yejiko/Downloads/prediction_dnn.pdf", height=8, width=12)
+
+tab_pred  %>% ggplot(aes(x=factor(absence), y=value, group=name, color=name)) + geom_point() + 
+  geom_line(lty=2, size = .8) + 
+  xlab("Absence rate P(M=1)") + 
+  ylab("Percent bias in predicted probabilities") + 
+  facet_grid(dep.absence ~ dep.outcome) + labs(color="Imputation method")+
+  scale_color_discrete(labels = c("Fixed-value imputation", "Conditional modeling", "MICE", "Joint modeling", "Data augmentation")) +
+  annotate("rect",
+           xmin = -Inf, xmax = Inf,
+           ymin = -10, ymax = 10,
+           fill = "grey", alpha = 0.4) +
+  #ylim(-0.04,0.06) +
+  #geom_hline(yintercept = 0, linetype = "dashed", size = .8) + 
+  theme_bw()
+
+graphics.off()
+```
+
+# Summarizing results: Prediction performance across absence rates and dependence levels
+
+```{r}
+# ---- indices for comparison ----
+
+# idx = c(21, 24, 27)
+# scen_lev = c("s11s","s14s","s17s")
+# scen_title = "Absence rate"
+# scen_lab = c("0.1", "0.4", "0.7")
+
+# idx = c(25,26,27)
+# scen_lev = c("s17w","s17m","s17s")
+# scen_title = substitute(paste("Dependence of ", italic("M"), " on ", italic("X,Y")))
+# scen_lab = c("Weak", "Moderate", "Strong")
+
+idx = c(9, 18, 27)
+scen_lev = c("w17s","m17s","s17s")
+scen_title = substitute(paste("Dependence of ", italic("Y"), " on ", italic("X")))
+scen_lab = c("Weak", "Moderate", "Strong")
+
+models  <- c("glm","rf","xgb","dnn")
+methods <- c("median","cm","mice","jm","da")
+
+all_df <- do.call(
+  rbind,
+  lapply(seq_along(idx), function(k) {
+    
+    i <- idx[k]
+    
+    do.call(
+      rbind,
+      lapply(1:100, function(j) {
+        
+        do.call(
+          rbind,
+          lapply(models, function(m) {
+            
+            df <- pred_list[[i]]$predict[[j]][[m]]
+            
+            out <- df[, methods] - df[, "true"]
+            
+            data.frame(
+              scenario = scen_lev[k],
+              sim = j,
+              model = m,
+              true = df[, "true"],
+              out
+            )
+          })
+        )
+      })
+    )
+  })
+)
+
+# percent bias within simulation
+sim_summary <- all_df %>%
+  group_by(scenario, model, sim) %>%
+  summarise(
+    median = 100 * mean(median, na.rm = TRUE) / mean(true, na.rm = TRUE),
+    cm     = 100 * mean(cm, na.rm = TRUE) / mean(true, na.rm = TRUE),
+    mice   = 100 * mean(mice, na.rm = TRUE) / mean(true, na.rm = TRUE),
+    jm     = 100 * mean(jm, na.rm = TRUE) / mean(true, na.rm = TRUE),
+    da     = 100 * mean(da, na.rm = TRUE) / mean(true, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# average across simulations
+mean_summary <- sim_summary %>%
+  group_by(scenario, model) %>%
+  summarise(
+    median = mean(median, na.rm = TRUE),
+    cm     = mean(cm, na.rm = TRUE),
+    mice   = mean(mice, na.rm = TRUE),
+    jm     = mean(jm, na.rm = TRUE),
+    da     = mean(da, na.rm = TRUE),
+    .groups = "drop"
+  )
+mean_summary
+
+df <- pivot_longer(
+  mean_summary,
+  cols = c(median, cm, mice, jm, da),
+  names_to = "method",
+  values_to = "bias"
+)
+
+# ---- factor ordering ----
+df$model <- factor(
+  df$model,
+  levels = c("glm", "rf", "xgb", "dnn"),
+  labels = c("Logistic regression", "Random forest", "XGBoost", "Deep neural network")
+)
+
+df$method <- factor(
+  df$method,
+  levels = c("median", "cm", "mice", "jm", "da"),
+  labels = c("Fixed-value imputation", "Conditional modeling", "MICE", "Joint modeling", "Data augmentation")
+)
+
+df$scenario <- factor(
+  df$scenario,
+  levels = scen_lev,
+  labels = scen_lab
+)
+
+# ---- plot RMSE ----
+plot = ggplot(df, aes(y = model, x = bias, color = scenario)) +
+  geom_point(size = 2.8) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  # annotate("rect",
+  #          xmin = -10, xmax = 10,
+  #          ymin = -Inf, ymax = Inf,
+  #          fill = "grey", alpha = 0.4) +
+  scale_y_discrete(limits = rev) +
+  facet_wrap(method ~ ., strip.position = "top", ncol = 1) +
+  #scale_color_brewer(palette= "Reds") +
+  #scale_color_brewer(palette = "Blues") +
+  scale_color_brewer(palette= "Greens") +
+  labs(
+    y = "Prediction model",
+    x = "Percent bias (%)",
+    color = scen_title
+  ) +
+  theme_bw(base_size = 13)
+
+pdf("/Users/yejiko/Downloads/pred_comp_dep_y.pdf", height = 6, width = 8)
+plot
+graphics.off()
+
+```
+
+# Summarizing results: Distributions of imputed vs. true biomakers by imputation method
+
+```{r}
+sim_obj <- sim_w11w
+
+methods <- c(
+  true   = "True values",
+  median = "Fixed-value imputation",
+  cm     = "Conditional modeling",
+  mice   = "MICE",
+  jm     = "Joint modeling",
+  da     = "Data augmentation")
+
+make_df <- function(x) {
+  map_dfc(names(methods), ~ tibble(!!.x := x[[.x]])) %>%
+    pivot_longer(everything(), names_to = "Method", values_to = "Value") %>%
+    mutate(Method = factor(Method, levels = names(methods), labels = methods))
+}
+
+plot_dist <- function(df, title, xlim_vals = NULL) {
+  p <- ggplot(df, aes(Value)) +
+    geom_histogram(bins = 30, fill = "gray80", color = "gray50") +
+    # geom_vline(
+    #   data = df %>% summarise(mu = mean(Value, na.rm = TRUE), .by = Method),
+    #   aes(xintercept = mu),
+    #   color = "gray60",
+    #   linewidth = 1
+    # ) +
+    facet_wrap(~ Method, scales = "free") +
+    theme_bw() +
+    labs(x = NULL, y = "Count", title = ifelse(is.na(title), NULL, title))
+  
+  if (!is.null(xlim_vals)) p <- p + coord_cartesian(xlim = xlim_vals)
+  p
+}
+
+imp_df <- make_df(sim_obj$impute[[1]])
+
+pdf("imputation_hist.pdf", height=8, width=12)
+plot_dist(imp_df, title = NULL,
+          #title = "Distributions of Biomarker Values by Imputation Method", 
+          c(-10, 400))
+graphics.off()
+
+```
+
+
+```{r}
+saveRDS(sim_w11w, "sim_w11w_new")
+saveRDS(sim_w11m, "sim_w11m_new")
+saveRDS(sim_w11s, "sim_w11s_new")
+saveRDS(sim_w14w, "sim_w14w_new")
+saveRDS(sim_w14m, "sim_w14m_new")
+saveRDS(sim_w14s, "sim_w14s_new")
+saveRDS(sim_w17w, "sim_w17w_new")
+saveRDS(sim_w17m, "sim_w17m_new")
+saveRDS(sim_w17s, "sim_w17s_new")
+
+saveRDS(sim_m11w, "sim_m11w_new")
+saveRDS(sim_m11m, "sim_m11m_new")
+saveRDS(sim_m11s, "sim_m11s_new")
+saveRDS(sim_m14w, "sim_m14w_new")
+saveRDS(sim_m14m, "sim_m14m_new")
+saveRDS(sim_m14s, "sim_m14s_new")
+saveRDS(sim_m17w, "sim_m17w_new")
+saveRDS(sim_m17m, "sim_m17m_new")
+saveRDS(sim_m17s, "sim_m17s_new")
+
+saveRDS(sim_s11w, "sim_s11w_new")
+saveRDS(sim_s11m, "sim_s11m_new")
+saveRDS(sim_s11s, "sim_s11s_new")
+saveRDS(sim_s14w, "sim_s14w_new")
+saveRDS(sim_s14m, "sim_s14m_new")
+saveRDS(sim_s14s, "sim_s14s_new")
+saveRDS(sim_s17w, "sim_s17w_new")
+saveRDS(sim_s17m, "sim_s17m_new")
+saveRDS(sim_s17s, "sim_s17s_new")
+```
+
+```{r}
+sim_w11w = readRDS("/Users/yejiko/Downloads/res_complex/sim_w11w_new")
+sim_w11m = readRDS("/Users/yejiko/Downloads/res_complex/sim_w11m_new")
+sim_w11s = readRDS("/Users/yejiko/Downloads/res_complex/sim_w11s_new")
+sim_w14w = readRDS("/Users/yejiko/Downloads/res_complex/sim_w14w_new")
+sim_w14m = readRDS("/Users/yejiko/Downloads/res_complex/sim_w14m_new")
+sim_w14s = readRDS("/Users/yejiko/Downloads/res_complex/sim_w14s_new")
+sim_w17w = readRDS("/Users/yejiko/Downloads/res_complex/sim_w17w_new")
+sim_w17m = readRDS("/Users/yejiko/Downloads/res_complex/sim_w17m_new")
+sim_w17s = readRDS("/Users/yejiko/Downloads/res_complex/sim_w17s_new")
+
+sim_m11w = readRDS("/Users/yejiko/Downloads/res_complex/sim_m11w_new")
+sim_m11m = readRDS("/Users/yejiko/Downloads/res_complex/sim_m11m_new")
+sim_m11s = readRDS("/Users/yejiko/Downloads/res_complex/sim_m11s_new")
+sim_m14w = readRDS("/Users/yejiko/Downloads/res_complex/sim_m14w_new")
+sim_m14m = readRDS("/Users/yejiko/Downloads/res_complex/sim_m14m_new")
+sim_m14s = readRDS("/Users/yejiko/Downloads/res_complex/sim_m14s_new")
+sim_m17w = readRDS("/Users/yejiko/Downloads/res_complex/sim_m17w_new")
+sim_m17m = readRDS("/Users/yejiko/Downloads/res_complex/sim_m17m_new")
+sim_m17s = readRDS("/Users/yejiko/Downloads/res_complex/sim_m17s_new")
+
+sim_s11w = readRDS("/Users/yejiko/Downloads/res_complex/sim_s11w_new")
+sim_s11m = readRDS("/Users/yejiko/Downloads/res_complex/sim_s11m_new")
+sim_s11s = readRDS("/Users/yejiko/Downloads/res_complex/sim_s11s_new")
+sim_s14w = readRDS("/Users/yejiko/Downloads/res_complex/sim_s14w_new")
+sim_s14m = readRDS("/Users/yejiko/Downloads/res_complex/sim_s14m_new")
+sim_s14s = readRDS("/Users/yejiko/Downloads/res_complex/sim_s14s_new")
+sim_s17w = readRDS("/Users/yejiko/Downloads/res_complex/sim_s17w_new")
+sim_s17m = readRDS("/Users/yejiko/Downloads/res_complex/sim_s17m_new")
+sim_s17s = readRDS("/Users/yejiko/Downloads/res_complex/sim_s17s_new")
+```
