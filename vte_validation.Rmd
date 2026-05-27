@@ -1,0 +1,304 @@
+---
+title: "VTE validation"
+author: "Yeji Ko"
+output:
+  rmdformats::robobook:
+    thumbnails: no
+    lightbox: yes
+    gallery: no
+    highlight: tango
+    use_bookdown: no
+    toc_depth: 2
+    fig_caption: yes
+    code_folding: hide
+    embed_fonts: no
+    keep_md: no
+    number_sections: yes
+    html_document:
+    df_print: paged
+---
+
+```{r, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(mice)
+library(rms)
+library(stringr)
+library(condMVNorm)
+library(knitr)
+
+setwd("/Users/yejiko/Downloads/PhD")
+source("/Users/yejiko/Downloads/PhD/Grant/prelim/function.R")
+
+# data from clarity: used in simulation study
+# clarity = readRDS("/Users/yejiko/Downloads/PhD/Grant/clarity.analysis.dataset.rds")
+
+# updated data from clarity: used in pruned model
+clarity_new = readRDS("/Users/yejiko/Downloads/clarity.data.formatted.2025.09.22.rds")
+```
+
+# Model development in the derivation cohort
+
+We developed a pruned logistic regression model with 17 predictors for HA-VTE using the derivation cohort from clarity data. Missing values in 5 predictors were imputed with a fixed median value of each predictor. 
+
+```{r, warning=FALSE}
+clarity_new$heart.rate.trunc <- ifelse(clarity_new$HEART_RATE_FIRST_VALUE >= 144, 144, clarity_new$HEART_RATE_FIRST_VALUE)
+clarity_new = clarity_new %>% mutate(admit.type = factor(str_trim(as.character(admit.type))))
+data.dev <- clarity_new[clarity_new$validation.starting.cy2021 == "Build",]
+data.dev = data.dev %>% dplyr::select(vte.hac, admit.type, CENTRAL_LINE_DURING_ENC, HYPOXEMIA, ECM_WGHTLOSS, ECM_COAG,
+                                       CRP_FIRST_VAL, BUN_FIRST_VAL, ECM_RENLFL_MOD, ECM_RENLFL_SEV, heart.rate.trunc,
+                                       ECM_PSYCHOSES, SODIUM_FIRST_VAL, CHLORIDE_FIRST_VAL, ECM_PARALYSIS, ECM_ANEMDEF,
+                                       ECM_ULCER_PEPTIC, ECM_LUNG_CHRONIC)
+# Median Value Imputation
+# Step 1: Calculate median values from the Development cohort
+median.values <- data.dev %>%
+  summarise(across(where(is.numeric), median, na.rm = TRUE))
+
+# Step 2: Apply median imputation using the Development cohort medians
+data.dev <- data.dev %>%
+  mutate(across(where(is.numeric), 
+                ~ ifelse(is.na(.), median.values[[cur_column()]], .)))
+
+mod.prev.vars <- lrm(vte.hac ~ CENTRAL_LINE_DURING_ENC +
+                      #HEART_RATE_FIRST_VALUE +
+                       admit.type +
+                       HYPOXEMIA +
+                       #THROMBOSIS_HX +
+                       ECM_WGHTLOSS +
+                       ECM_COAG +
+                       CRP_FIRST_VAL +
+                       BUN_FIRST_VAL +
+                       ECM_RENLFL_MOD +
+                       ECM_RENLFL_SEV +
+                       heart.rate.trunc +
+                       ECM_PSYCHOSES +
+                       SODIUM_FIRST_VAL +
+                       CHLORIDE_FIRST_VAL+
+                       ECM_PARALYSIS +
+                       ECM_ANEMDEF+
+                       ECM_ULCER_PEPTIC+
+                       ECM_LUNG_CHRONIC, data = data.dev)
+
+print(mod.prev.vars)
+```
+
+# Development cohort performance
+
+```{r, warning=FALSE}
+data.dev$pred.prev.mod <- predict(mod.prev.vars, data.dev, type = "fitted")
+data.dev$vte.hac.numeric <- as.numeric(as.character(data.dev$vte.hac))
+val.prob(data.dev$pred.prev.mod, data.dev$vte.hac.numeric) # 0.826
+```
+
+# Validation cohort exploration
+
+```{r, warning=FALSE}
+data.val <- clarity_new[clarity_new$validation.starting.cy2021 == "Validation",]
+data.val = data.val %>% dplyr::select(vte.hac, admit.type, CENTRAL_LINE_DURING_ENC, HYPOXEMIA, ECM_WGHTLOSS, ECM_COAG,
+                                       CRP_FIRST_VAL, BUN_FIRST_VAL, ECM_RENLFL_MOD, ECM_RENLFL_SEV, heart.rate.trunc,
+                                       ECM_PSYCHOSES, SODIUM_FIRST_VAL, CHLORIDE_FIRST_VAL, ECM_PARALYSIS, ECM_ANEMDEF,
+                                       ECM_ULCER_PEPTIC, ECM_LUNG_CHRONIC)
+
+100*colSums(is.na(data.val))/nrow(data.val)
+```
+
+We have 5 variables (all continuous) with missing values: CRP_FIRST_VAL, BUN_FIRST_VAL, heart.rate.trunc, SODIUM_FIRST_VAL, CHLORIDE_FIRST_VAL. CRP and BUN follow non-normal distribution, whereas heart rate, sodium, and chloride level are normally distributed. After log transformation, BUN follow normal distribution, confirming that its original distribution is log-normal distribution. On the contrary, CRP does not show normal distribution after log transformation.
+
+```{r, warning=FALSE}
+par(mfrow = c(1,2))
+hist(data.val$CRP_FIRST_VAL, main="CRP distribution") # log normal
+hist(log(data.val$CRP_FIRST_VAL), maub="log transformed CRP distribution")
+par(mfrow = c(1,2))
+hist(data.val$BUN_FIRST_VAL, main="BUN distribution") # log normal
+hist(log(data.val$BUN_FIRST_VAL), main="log transformed BUN distribution")
+par(mfrow = c(1,3))
+hist(data.val$heart.rate.trunc)
+hist(data.val$SODIUM_FIRST_VAL)
+hist(data.val$CHLORIDE_FIRST_VAL)
+```
+
+# Validation cohort performance after imputation
+
+## 1. Fixed value with median
+
+```{r, warning=FALSE}
+data.val <- clarity_new[clarity_new$validation.starting.cy2021 == "Validation",]
+data.val = data.val %>% dplyr::select(vte.hac, admit.type, CENTRAL_LINE_DURING_ENC, HYPOXEMIA, ECM_WGHTLOSS, ECM_COAG,
+                                       CRP_FIRST_VAL, BUN_FIRST_VAL, ECM_RENLFL_MOD, ECM_RENLFL_SEV, heart.rate.trunc,
+                                       ECM_PSYCHOSES, SODIUM_FIRST_VAL, CHLORIDE_FIRST_VAL, ECM_PARALYSIS, ECM_ANEMDEF,
+                                       ECM_ULCER_PEPTIC, ECM_LUNG_CHRONIC)
+
+
+data_imp <- data.val %>%
+  mutate(across(where(is.numeric), 
+                ~ ifelse(is.na(.), median.values[[cur_column()]], .)))
+
+med = data_imp$pred.prev.mod = predict(mod.prev.vars, data_imp, type = "fitted") 
+data_imp$vte.hac.numeric <- as.numeric(as.character(data_imp$vte.hac))
+val.prob(data_imp$pred.prev.mod, data_imp$vte.hac.numeric) # 0.827
+```
+
+## 2. Conditional modeling
+
+```{r, warning=FALSE}
+mice_obj <- mice(data = data.val[, 2:18], m = 1, method = 'pmm', print = FALSE)
+da_imp = complete(mice_obj, 1) # single imputation instead of multiple imputation
+
+hist(data_imp$CRP_FIRST_VAL, main = "Distribution of CRP after imputation")
+cmi = data_imp$pred.prev.mod <- predict(mod.prev.vars, da_imp, type = "fitted")
+val.prob(data_imp$pred.prev.mod, data_imp$vte.hac.numeric) # 0.824
+```
+
+## 3. Joint modeling
+
+```{r, warning=FALSE}
+convert_binary_to_factor <- function(data) {
+  
+  data[] <- lapply(data, function(x) {
+    
+    # Identify binary numeric variables (0/1 only)
+    if (is.numeric(x) && all(na.omit(x) %in% c(0, 1))) {
+      return(factor(x, levels = c(0, 1), labels = c("0", "1")))
+    }
+    
+    # Identify logical variables
+    if (is.logical(x)) {
+      return(factor(x, levels = c(FALSE, TRUE), labels = c("0", "1")))
+    }
+    
+    # Otherwise keep original variable
+    return(x)
+  })
+  
+  return(as.data.frame(data))
+}
+
+
+data.val.wide <- data.val[,2:18] %>%
+    fastDummies::dummy_cols(select_columns = "admit.type",
+                            remove_selected_columns = TRUE,
+                            remove_first_dummy = FALSE) %>%
+    dplyr::rename_with(~ gsub("admit.type_", "", .x)) %>%
+    mutate(dplyr::across(where(is.factor), ~ as.numeric(as.character(.))))
+  
+mean <- colMeans(data.val.wide, na.rm = TRUE)
+var <- cov(data.val.wide, use = "complete.obs")
+var[which(var != diag(var))] <- 0
+cov <- var + diag(ncol(var)) * 1e-5
+  
+m_times = 80
+jm_imps <- joint.MI(data.val.wide, mean, cov, n.imp = m_times)
+jm_list <- lapply(1:m_times, function(m){
+    tmp <- jm_imps[, , m]
+    cols <- c("Elective", "Emergency", "Trauma", "Urgent", "Missing")
+    tmp  %<>% data.frame() %>%
+                pivot_longer(cols = all_of(cols),
+                names_to = "admit.type",
+                values_to = "value") %>%
+                filter(value == 1) %>% dplyr::select(-value) %>%
+                convert_binary_to_factor()
+  })
+
+# Helper: average predictions across multiple imputations
+average_preds <- function(model, imp_list){
+  preds <- sapply(1:length(imp_list), function(m){
+    newdata <- imp_list[[m]]
+    predict(model, newdata=newdata, type="fitted")
+    })
+  rowMeans(preds)
+}
+
+hist(jm_list[[1]]$CRP_FIRST_VAL, main = "Distribution of CRP after imputation")
+jmi = data_imp$pred.prev.mod = average_preds(mod.prev.vars, jm_list)
+val.prob(data_imp$pred.prev.mod, data_imp$vte.hac.numeric) # 0.818
+```
+
+## 4. Data augmentation
+
+```{r, warning=FALSE}
+# CRP and BUN are transformed
+da_imps <- replicate(
+  m_times,
+  data_augment_em_mult(
+    data.val.wide,
+    max_iter = 10,
+    verbose = FALSE
+  ),
+  simplify = FALSE
+)
+
+# check what one run looks like
+str(da_imps[[1]])
+
+# convert each run to a numeric matrix and stack into 3D array
+da_imps_arr <- simplify2array(lapply(da_imps, function(x) as.matrix(x)))
+
+dim(da_imps_arr)
+# should be: 171891 21 m_times
+
+# example: 1st imputed dataset (as matrix)
+da_imps_arr[,,1]
+
+da_list <- lapply(1:m_times, function(m){
+    tmp <- da_imps_arr[, , m]
+    cols <- c("Elective", "Emergency", "Trauma", "Urgent", "Missing")
+    tmp  %<>% data.frame() %>%
+                pivot_longer(cols = all_of(cols),
+                names_to = "admit.type",
+                values_to = "value") %>%
+                filter(value == 1) %>% dplyr::select(-value) %>%
+                convert_binary_to_factor()
+  })
+
+hist(da_imps$CRP_FIRST_VAL, main = "Distribution of CRP after imputation")
+hist(da_imps$BUN_FIRST_VAL, main = "Distribution of heart rate after imputation")
+
+# use average_preds instead of predict()
+da = data_imp$pred.prev.mod =  average_preds(mod.prev.vars, da_list)
+val.prob(data_imp$pred.prev.mod, data_imp$vte.hac.numeric) # 0.823
+```
+
+## 5. MICE
+
+```{r, warning=FALSE}
+mice_obj <- mice(data = data.val[, 2:18], m = m_times, method = 'pmm', print = FALSE)
+mice_list <- lapply(1:mice_obj$m, function(m){
+    tmp <- complete(mice_obj, m)
+    tmp
+  })
+
+hist(data_imp$CRP_FIRST_VAL, main = "Distribution of CRP after imputation")
+mice = data_imp$pred.prev.mod = average_preds(mod.prev.vars, mice_list)
+val.prob(data_imp$pred.prev.mod, data_imp$vte.hac.numeric) # 0.824
+```
+
+# Summary
+
+When applying different imputation methods to the validation cohort to evaluate the pruned model, MICE yielded the best discrimination and calibration performance. Median imputation achieved comparable discrimination (C statistic), likely because it aligns with the imputation strategy used during model development, but its calibration was notably inferior to MICE. Although data augmentation produced reasonable distributions for imputed variables (see histograms above), it performed very poorly, particularly in calibration.
+
+```{r, warning=FALSE}
+par(mfrow = c(3,2)) 
+v_med = val.prob(med, data_imp$vte.hac.numeric)
+v_cmi = val.prob(cmi, data_imp$vte.hac.numeric)
+v_jmi = val.prob(jmi, data_imp$vte.hac.numeric)
+v_da = val.prob(da, data_imp$vte.hac.numeric)
+v_mice = val.prob(mice, data_imp$vte.hac.numeric)
+
+# c statistics, calibration slope and intercept
+results_table <- data.frame(
+  Imputation_Method = c(
+    "Median Imputation",
+    "Conditional Modeling Imputation",
+    "Joint Modeling Imputation",
+    "Data Augmentation",
+    "MICE"),
+  AUC = c(0.827, 0.800, 0.818, 0.822, 0.824), 
+  cal_slope = c(0.995, 0.896, 1.012, 0.931, 0.953),
+  cal_intercept = c(0.281, 0.396, 0.220, -0.111, -0.037))
+
+names(results_table)[2:4] = c("C statistic", "Calibration slope", "Calibration intercept")
+kable(results_table)
+```
+
+
+
